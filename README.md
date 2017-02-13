@@ -1,7 +1,15 @@
 # X86Assembly
 
-[![Build Status](https://travis-ci.org/Keno/X86Assembly.jl.svg?branch=master)](https://travis-ci.org/Keno/X86Assembly.jl)
+This is a WIP x86 disassembler. Design goals:
 
-[![Coverage Status](https://coveralls.io/repos/Keno/X86Assembly.jl/badge.svg?branch=master&service=github)](https://coveralls.io/github/Keno/X86Assembly.jl?branch=master)
+- No hardcoded tables. Instruction definitions are parsed from the Intel Manual.
+- Performance.
 
-[![codecov.io](http://codecov.io/github/Keno/X86Assembly.jl/coverage.svg?branch=master)](http://codecov.io/github/Keno/X86Assembly.jl?branch=master)
+Approach:
+1. Parser for Intel manual. Simple disassembler that walks the tables and produces
+   necessary information (in progress). Can be slow.
+2. Compiler for special cases. E.g. in a lot of cases, we may only care about,
+   instruction length or clobbered registers, etc. Must be fast (not yet started)
+3. For 2, experiment with running the parser in 1 over, over the tree of possible
+   opcode, post-composing with the transformation of interest and generating
+   instructions from that.
