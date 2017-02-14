@@ -150,6 +150,19 @@ ADDSS:
       VADDSS xmm1{k1}{z}, xmm2, xmm3/m32{er}
 """
 
+struct InstrProperties
+    # Has support for embedded rounding control
+    er::Bool
+    # Has support for suppress-all-exceptions
+    sae::Bool
+    # Has support for zero-merging option
+    z::Bool
+    # Has support for masking
+    masking::Bool
+    # Operand encoding category
+    enc::String
+end
+
 opcode_table = Dict{UInt8,Any}()
 # First level is indexed by vex 11 bits:
 # L'LWppmmmm
@@ -194,7 +207,11 @@ while i <= length(lines)
           2
       end
     end
-    data = (desc, ops, enc)
+    er = contains(desc, "{er}")
+    sae = contains(desc, "{sae}") || contains(desc, "{er}")
+    z = contains(desc, "{z}")
+    masking = contains(desc, "{k1}")
+    data = (desc, ops, InstrProperties(er, sae, z, masking, enc))
     while true
         opcode = opcodes[j]
         if startswith(opcode, "REX")
@@ -227,6 +244,7 @@ while i <= length(lines)
             end
             if (parts[1] == "EVEX") && parts[3] in ["512","LIG"]
                 add_to_table_W!(table, base_vex | (0b10<<9), opc, data, parts[6])
+                add_to_table_W!(table, base_vex | (0b11<<9), opc, data, parts[6])
             end
             break
         end
@@ -284,8 +302,32 @@ struct QualifiedOperand
     # 1 - vector
     # 2 - other
     category::UInt8
-    mask::UInt8
     op::Operand
+end
+
+struct AVX512Operand
+    # (-1)%UInt8: None by instr def
+    mask::UInt8
+    zero_combining::Bool
+    # Suppres all exceptions
+    sae::Bool
+    # Static round overwrite
+    er::Bool
+    rounding_mode::UInt8
+end
+
+function Base.show(io::IO, op::AVX512Operand)
+    (op.mask != -1%UInt8 && op.mask != 0) && print(io, "{k",op.mask,"}")
+    op.zero_combining && print(io, "{z}")
+    if op.er
+      @assert op.rounding_mode <= 0b11
+      print(io, op.rounding_mode == 0b00 ? "{rn-sae}" :
+                  op.rounding_mode == 0b01 ? "{rd-sae}" :
+                  op.rounding_mode == 0b10 ? "{ru-sae}" :
+                                             "{rz-sae}")
+    elseif op.sae
+        print(io, "{sae}")
+    end
 end
 
 gpregs = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
@@ -407,9 +449,9 @@ function parseOpc(data)
             fake_rex = ~((V2 & 0b11100000) >> 5)
             vvvv = ~((V3 & 0b01111000) >> 3) & 0b1111
             opc = read(input, UInt8)
-            desc, ops, enc = vex_opcode_table[vex_byte][opc]
+            desc, ops, data = vex_opcode_table[vex_byte][opc]
             print(STDOUT, desc, " ")
-            println(STDOUT, parseOperands(enc, fake_rex, vvvv, opc, ops, input))
+            println(STDOUT, parseOperands(data.enc, fake_rex, vvvv, opc, ops, input))
         elseif c == 0xc5
             @assert rex == 0
             # 2-byte VEX prefix
@@ -419,15 +461,18 @@ function parseOpc(data)
             fake_rex = ((~V2 & 0b10000000) >> 5)
             vvvv = ~((V2 & 0b01111000) >> 3) & 0b1111
             opc = read(input, UInt8)
-            desc, ops, enc = vex_opcode_table[vex_byte][opc]
+            desc, ops, data = vex_opcode_table[vex_byte][opc]
             print(STDOUT, desc, " ")
-            println(STDOUT, parseOperands(enc, fake_rex, vvvv, opc, ops, input))
+            println(STDOUT, parseOperands(data.enc, fake_rex, vvvv, opc, ops, input))
         elseif c == 0x62
             @assert rex == 0
             # 4-byte EVEX prefix
             P0 = read(input, UInt8)
             P1 = read(input, UInt8)
             P2 = read(input, UInt8)
+            z = (P2 & 0b10000000) >> 7
+            b = (P2 & 0b00010000) >> 4
+            aaa = (P2 & 0b00000111)
             L′L = UInt16((P2 & 0b01100000) >> 5)
             W = UInt16((P1 & 0b10000000) >> 7)
             vex_byte = (P0 & 0b11) | ((P1 & 0b11) << 6) | L′L << 9 | W << 8
@@ -435,9 +480,11 @@ function parseOpc(data)
             fake_rex = ~((P0 >> 5) | (P0 & 0b00010000) << 3)
             vvvv = (((~P1 & 0b01111000) >> 3) | ((~P2 & 0b1000) << 1))
             opc = read(input, UInt8)
-            desc, ops, enc = evex_opcode_table[vex_byte][opc]
+            desc, ops, data = evex_opcode_table[vex_byte][opc]
+            avx512o = AVX512Operand(aaa, z, (data.sae & b), (data.er & b),
+              ((data.er & b) != 0) ? L′L : 0)
             print(STDOUT, desc, " ")
-            println(STDOUT, parseOperands(enc, fake_rex, vvvv, opc, ops, input))
+            println(STDOUT, tuple(avx512o, parseOperands(data.enc, fake_rex, vvvv, opc, ops, input)...))
         else
             opc = c
             table_or_data = opcode_table[opc]
@@ -447,9 +494,9 @@ function parseOpc(data)
                 table_or_data = table_or_data[opc]
             end
             # data, not table
-            desc, ops, enc = table_or_data
+            desc, ops, data = table_or_data
             print(STDOUT, desc, " ")
-            println(STDOUT, parseOperands(enc, rex, 0, opc, ops, input))
+            println(STDOUT, parseOperands(data.enc, rex, 0, opc, ops, input))
             rex = 0x0
         end
     end
