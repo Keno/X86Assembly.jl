@@ -150,6 +150,27 @@ ADDSS:
       VADDSS xmm1{k1}{z}, xmm2, xmm3/m32{er}
 """
 
+# Corner cases:
+# Q: What happens when there's an optional prefix after a mandatory prefix?
+#     e.g. F3 66 0F 58 ED
+# A: Get's decoded as as if prefixes reversed
+#
+# Q: Can an instruction meaningfully have more than one group 1 prefix?
+#     e.g. F0 F2 64 83 0C 25 08 03 00 00 10 or
+#          F2 F0 64 83 0C 25 08 03 00 00 10 or
+# A: Yes, this gets interpreted as xacquire/xrelease
+#
+# Q: What happens with multiple group 2 prefixes?
+#     e.g. 0x26 0x2e 0x8b 0x45 0x20
+#       or 0x2e 0x26 0x8b 0x45 0x20
+# A: The prefix closest to the opcode prevails
+#
+# Q: What happens when mandatory prefixes are in conflict?
+#     e.g. 0xF2 0x66 0x0F 0x12 0xED vs
+#          0x66 0xF2 0x0F 0x12 0xED
+#
+# A: F2/F3 Takes precedence
+
 struct InstrProperties
     # Has support for embedded rounding control
     er::Bool
@@ -163,7 +184,11 @@ struct InstrProperties
     enc::String
 end
 
-opcode_table = Dict{UInt8,Any}()
+basic_table = Dict{UInt8,Any}()
+table_f20f = Dict{UInt8,Any}()
+table_f30f = Dict{UInt8,Any}()
+table_660f = Dict{UInt8,Any}()
+
 # First level is indexed by vex 11 bits:
 # L'LWppmmmm
 const vex_opcode_table = Dict{UInt16,Any}()
@@ -252,11 +277,12 @@ while i <= length(lines)
           base, addend = split(opcode,'+')
           opc_base = parse(UInt8, base, 16)
           for opc in opc_base:opc_base+7
-            opcode_table[opc] = (strip(lines[i+1]), enc)
+            basic_table[opc] = data
           end
         else
           opc = parse(UInt8, opcode, 16)
-          this_opcode_table = opcode_table
+          this_opcode_table = basic_table
+          at_start = true
           while length(opcodes) >= j+1
               j += 1
               next_opcode = opcodes[j]
@@ -265,12 +291,26 @@ while i <= length(lines)
               end
               last_opc = opc
               opc = parse(UInt8, next_opcode, 16)
+              # Mandatory prefixes
+              if at_start && (last_opc == 0xF2 || last_opc == 0xF3 || last_opc == 0x66)
+                  @assert opc == 0x0F
+                  this_opcode_table = last_opc == 0xF2 ? table_f20f :
+                                      last_opc == 0xF3 ? table_f30f :
+                                                         table_660f
+                  j += 1
+                  opc = parse(UInt8, opcodes[j], 16)
+                  at_start = false
+                  continue
+              end
+              at_start = false
               if !haskey(this_opcode_table, last_opc)
                   this_opcode_table[last_opc] = Dict{UInt8,Any}()
               end
               this_opcode_table = this_opcode_table[last_opc]
           end
-          this_opcode_table[opc] = data
+          if opcodes[j] != "/0" && opcodes[j] != "/6" # Skip for now
+            this_opcode_table[opc] = data
+          end
         end
         break
     end
@@ -288,14 +328,15 @@ simplef = [
   0xc3,                     # retq
 ]
 
-struct Operand
+struct Operand{S, T}
     deref::Bool
     # -1%UInt8 indicates absolute
-    base::UInt8
-    scale::UInt8
-    index::UInt8
-    disp::Int32
+    base::S
+    scale::S
+    index::S
+    disp::T
 end
+representative(op::Operand{UInt8, <:Integer}) = op
 
 struct QualifiedOperand
     # 0 - general purpose
@@ -307,25 +348,27 @@ end
 
 struct AVX512Operand
     # (-1)%UInt8: None by instr def
-    mask::UInt8
-    zero_combining::Bool
+    mask
+    zero_combining
     # Suppres all exceptions
-    sae::Bool
+    sae
     # Static round overwrite
-    er::Bool
-    rounding_mode::UInt8
+    er
+    rounding_mode
 end
+representative(op::AVX512Operand) = op
 
 function Base.show(io::IO, op::AVX512Operand)
+    op = representative(op)
     (op.mask != -1%UInt8 && op.mask != 0) && print(io, "{k",op.mask,"}")
-    op.zero_combining && print(io, "{z}")
-    if op.er
+    op.zero_combining != 0 && print(io, "{z}")
+    if op.er != 0
       @assert op.rounding_mode <= 0b11
       print(io, op.rounding_mode == 0b00 ? "{rn-sae}" :
                   op.rounding_mode == 0b01 ? "{rd-sae}" :
                   op.rounding_mode == 0b10 ? "{ru-sae}" :
                                              "{rz-sae}")
-    elseif op.sae
+    elseif op.sae != 0
         print(io, "{sae}")
     end
 end
@@ -344,8 +387,11 @@ function print_reg(io::IO, category, reg)
 end
           
 function Base.show(io::IO, op::Operand, category=0)
+    op = representative(op)
     if !op.deref
         print_reg(io, category, op.base)
+    elseif op.base == -1%UInt8
+        print(io, "[", op.disp, "]")
     else
         print(io, "(")
         print_reg(io, category, op.base)
@@ -359,10 +405,79 @@ function Base.show(io::IO, op::QualifiedOperand)
     show(io, op.op, op.category)
 end
 
+macro invalid(reason)
+    :(return nothing)
+end
+
+# This is produced by the (hand-coded) fast prefix decoder and consumed by
+# the general instruction decoder
+struct prefix_status{T}
+    nprefix_bytes::UInt8
+    first_f2f3::UInt8
+    last_f2f3::UInt8
+    last_valid_seg_prefix::UInt8
+    has_lock::Bool
+    has_66h::Bool
+    has_67h::Bool
+    rex::T
+    first_non_prefix_byte::T
+end
+
+const MAX_INSTR_BYTES = 15
+
+# This is shared between the fast and the slow path - performance matters
+function fast_prefix_scanner(input, mode = processor_modes(true,true))
+    nprefix_bytes::UInt8 = 0
+    first_f2f3::UInt8 = 0
+    last_f2f3::UInt8 = 0
+    last_valid_seg_prefix::UInt8 = 0
+    has_lock::Bool = 0
+    has_66h::Bool = false
+    has_67h::Bool = false
+    rex::UInt8 = 0
+    first_non_prefix_byte::UInt8 = 0
+    @assert mode.Lflag
+    while !eof(input) && nprefix_bytes < MAX_INSTR_BYTES
+        c::UInt8 = read(input, UInt8)
+        if c == 0x66
+            # Operand size override prefix
+            has_66h = true
+            rex = 0
+        elseif c == 0x67
+            # Address size override prefix
+            has_67h = true
+            rex = 0
+        elseif c == 0x2E || c == 0x3E || c == 0x26 || c == 0x36
+            # Legacy segment prefixes - ignored in 64bit mode
+            !(mode.Lflag) && (last_valid_seg_prefix = c)
+            rex = 0
+        elseif c == 0x64 || c == 0x65
+            last_valid_seg_prefix = c
+            rex = 0
+        elseif c == 0xF0
+            has_lock = true
+            rex = 0
+        elseif c == 0xF2 || c == 0xF3
+            first_f2f3 == 0 && (first_f2f3 = c)
+            last_f2f3 = c
+        elseif mode.Lflag && 0x40 <= c <= 0x4F
+            rex = c
+        else
+            first_non_prefix_byte = c
+            break
+        end
+    end
+    prefix_status(nprefix_bytes, first_f2f3, last_f2f3, last_valid_seg_prefix,
+                  has_lock, has_66h, has_67h, rex, first_non_prefix_byte)
+end
+
+rex_w(rex) = (rex & 0b1000)
 rex_b(rex) = ((rex&0b001) << 3)
 rex_x(rex) = ((rex&0b010) << 2)
 rex_r(rex) = ((rex&0b100) << 1)
-rex_r′(rex) = ((rex&0b10000000) >> 7)
+rex_r′(rex) = ((rex&0b10000000) >> 4)
+
+readImmediate(input::IO, T) = read(input, T)
 
 # Returns (Reg, R/M)
 function parseModRM(rex, io, evex = false)
@@ -370,135 +485,235 @@ function parseModRM(rex, io, evex = false)
     mod = (0b11000000 & modrmb) >> 6
     reg = (0b00111000 & modrmb) >> 3
     rm  = (0b00000111 & modrmb)
-    op1 = Operand(false, reg | rex_r(rex) | rex_r′(rex), 0, 0, 0)
+    op1 = Operand(false, reg | rex_r(rex) | (rex_r′(rex) << 1), UInt8(0), UInt8(0), 0)
     if mod == 0b11
-        @assert !evex || rex_x(rex) == 0
-        op2 = Operand(false, rm | rex_b(rex) | (rex_x(rex) << 1), 0, 0, 0)
+        (evex || rex_x(rex) == 0) || @invalid "Only allowed with evex encoding"
+        op2 = Operand(false, rm | rex_b(rex) | (rex_x(rex) << 1), UInt8(0), UInt8(0), 0)
         return (op1, op2)
     end
-    op2_base::UInt8 = rm | rex_b(rex)
-    load_scale::UInt8 = 1
+    op2_base::typeof(rm) = rm | rex_b(rex)
+    load_scale::typeof(rm) = 1
     disp::Int32 = 0
-    sib_index::UInt8 = 0
+    sib_index::typeof(rm) = 0
     if rm == 0b100
         # With sib byte
         sib = read(io, UInt8)
         sib_base = (sib & 0b111)
         op2_base = sib_base | rex_b(rex)
-        load_scale = 1 << ((sib & 0b11000000) >> 6)
+        load_scale = ((sib & 0b11000000) >> 6)
         sib_index = (sib & 0b00111000) >> 3 | rex_x(rex)
         if sib_index == 0b11 # index = sp special case
             load_scale = 0
         end
         if mod == 0b00 && sib_base == 0b101 # base = bp special case
-            disp = read(io, UInt32)%Int32
+            disp = readImmediate(io, UInt32)%Int32
             op2_base = -1 % UInt8
         end
     end
     if mod == 0b00
         if rm == 0b101
-            disp = read(data, UInt32)%Int32
+            disp = readImmediate(io, UInt32)%Int32
             op2 = Operand(true, -1%UInt8, 1, 0, disp)
             return (op1, op2)
         end
     elseif mod == 0b01
-        disp = Int32(read(io, UInt8)%Int8)
+        disp = Int32(readImmediate(io, UInt8)%Int8)
     elseif mod == 0b10
-        disp = read(io, UInt32)%Int32
+        disp = readImmediate(io, UInt32)%Int32
     end
     op2 = Operand(true, op2_base, sib_index, load_scale, disp)
     (op1, op2)
 end
 
-function parseOperands(enc,rex,vex,opc,ops,data)
+macro maybe(expr)
+    x = gensym()
+    esc(quote
+        $x = $expr
+        $x === nothing && return nothing
+        $x
+    end)
+end
+
+function parseOperands(enc,rex,vex,opc,ops,data,evex)
     if enc == "MR"
-        a,b = parseModRM(rex, data)
+        a,b = @maybe parseModRM(rex, data, evex)
         (QualifiedOperand(ops[1],b), QualifiedOperand(ops[2],a))
     elseif enc == "RM"
-        a,b = parseModRM(rex, data)
+        a,b = @maybe parseModRM(rex, data, evex)
         (QualifiedOperand(ops[1],a), QualifiedOperand(ops[2],b))
     elseif enc == "RVM" || enc == "T1S"
-        a,b = parseModRM(rex, data)
-        op2 = Operand(false, vex, 0, 0, 0)
+        a,b = @maybe parseModRM(rex, data, evex)
+        op2 = Operand(false, vex, UInt8(0), UInt8(0), 0)
         (QualifiedOperand(ops[1],a), QualifiedOperand(ops[2],op2), QualifiedOperand(ops[3],b))
     elseif enc == "O"
         (QualifiedOperand(ops[1],
           Operand(false, (opc & 0b111)|rex_b(rex), 0%UInt8, 0%UInt8, 0%UInt32)),)
+    elseif enc == "OI"
+      (QualifiedOperand(ops[1],
+        Operand(false, (opc & 0b111)|rex_b(rex), 0%UInt8, 0%UInt8, 0%UInt32)),
+        readImmediate(data, UInt32))
     elseif enc == "ZO"
         ()
+    elseif enc == "FD" || enc == "TD"
+        #TODO: These two are wrong
+        (readImmediate(data, UInt32),)
+    elseif enc == "I"
+        (readImmediate(data, UInt32),)
     else
         error("Unimplemented encoding '$enc'")
     end
 end
 
-function parseOpc(data)
-    rex = 0x0
-    input = IOBuffer(data)
-    while !eof(input)
-        c = read(input, UInt8)
-        if 0x40 <= c <= 0x4F
-            rex = c
-        elseif c == 0xc4
-            @assert rex == 0
-            # 3-byte VEX prefix
-            V2 = read(input, UInt8)
-            V3 = read(input, UInt8)
-            L = UInt16((V3 & 0b100) >> 2)
-            W = UInt16((V3 & 0b10000000) >> 7)
-            vex_byte = ((V3 & 0b11) << 6) | (V2 & 0b1111) | L << 9 | W << 8
-            fake_rex = ~((V2 & 0b11100000) >> 5)
-            vvvv = ~((V3 & 0b01111000) >> 3) & 0b1111
-            opc = read(input, UInt8)
-            desc, ops, data = vex_opcode_table[vex_byte][opc]
-            print(STDOUT, desc, " ")
-            println(STDOUT, parseOperands(data.enc, fake_rex, vvvv, opc, ops, input))
-        elseif c == 0xc5
-            @assert rex == 0
-            # 2-byte VEX prefix
-            V2 = read(input, UInt8)
-            L = UInt16((V2 & 0b100) >> 2)
-            vex_byte = ((V2 & 0b11) << 6) | 0b1 | L << 9
-            fake_rex = ((~V2 & 0b10000000) >> 5)
-            vvvv = ~((V2 & 0b01111000) >> 3) & 0b1111
-            opc = read(input, UInt8)
-            desc, ops, data = vex_opcode_table[vex_byte][opc]
-            print(STDOUT, desc, " ")
-            println(STDOUT, parseOperands(data.enc, fake_rex, vvvv, opc, ops, input))
-        elseif c == 0x62
-            @assert rex == 0
-            # 4-byte EVEX prefix
-            P0 = read(input, UInt8)
-            P1 = read(input, UInt8)
-            P2 = read(input, UInt8)
-            z = (P2 & 0b10000000) >> 7
-            b = (P2 & 0b00010000) >> 4
-            aaa = (P2 & 0b00000111)
-            L′L = UInt16((P2 & 0b01100000) >> 5)
-            W = UInt16((P1 & 0b10000000) >> 7)
-            vex_byte = (P0 & 0b11) | ((P1 & 0b11) << 6) | L′L << 9 | W << 8
-            # We encode R′ in the high bit of fake rex
-            fake_rex = ~((P0 >> 5) | (P0 & 0b00010000) << 3)
-            vvvv = (((~P1 & 0b01111000) >> 3) | ((~P2 & 0b1000) << 1))
-            opc = read(input, UInt8)
-            desc, ops, data = evex_opcode_table[vex_byte][opc]
-            avx512o = AVX512Operand(aaa, z, (data.sae & b), (data.er & b),
-              ((data.er & b) != 0) ? L′L : 0)
-            print(STDOUT, desc, " ")
-            println(STDOUT, tuple(avx512o, parseOperands(data.enc, fake_rex, vvvv, opc, ops, input)...))
-        else
-            opc = c
-            table_or_data = opcode_table[opc]
-            while isa(table_or_data, Dict)
-                # table, not data
-                opc = read(input, UInt8)
-                table_or_data = table_or_data[opc]
+struct processor_modes
+    Dflag::Bool
+    Lflag::Bool
+end
+
+function dispatch_simple_op(input, prefix, opc)
+    table = basic_table
+    next_opc::typeof(opc) = 0
+    if opc == 0x0F && (prefix.last_f2f3 != 0 || prefix.has_66h)
+        next_opc = read(input, UInt8)
+        table = table[opc]
+        if prefix.last_f2f3 == 0xF2
+            if haskey(table_f20f, next_opc)
+                table = table_f20f
             end
-            # data, not table
-            desc, ops, data = table_or_data
-            print(STDOUT, desc, " ")
-            println(STDOUT, parseOperands(data.enc, rex, 0, opc, ops, input))
-            rex = 0x0
+        elseif prefix.last_f2f3 == 0xF3      
+            if haskey(table_f30f, next_opc)
+                table = table_f30f
+            end
+        elseif prefix.has_66h
+            if haskey(table_660f, next_opc)
+                table = table_660f
+            end
         end
+        opc = next_opc
+    end
+    !haskey(table, opc) && @invalid "Opcode not in table"
+    table_or_data = table[opc]
+    while isa(table_or_data, Dict)
+        # table, not data
+        opc = read(input, UInt8)
+        !haskey(table_or_data, opc) && @invalid "Opcode not in table"
+        table_or_data = table_or_data[opc]
+    end
+    # data, not table
+    desc, ops, data = table_or_data
+    operands = @maybe parseOperands(data.enc, prefix.rex, 0, opc, ops, input, false)
+    return sprint() do io
+      print(io, desc, " ")
+      println(io, operands)
+    end
+end
+
+concretize!(x::UInt8) = x
+
+parseOpc(data::Vector{UInt8}, mode = processor_modes(true,true)) =
+  parseOpc(IOBuffer(data), mode)
+
+
+  
+function parseOpc(input::IO, mode = processor_modes(true,true))
+    # Only supported for far
+    @assert mode.Lflag
+    operand_size = 4
+    address_size = 8
+    prefix_status = fast_prefix_scanner(input)
+    _parseOpc(input, prefix_status, mode)
+end
+
+function validate_legacy_prefixes_for_vex(prefix)
+    prefix.last_f2f3 == 0 || @invalid "No legacy prefixes allowed with (e)vex"
+    !prefix.has_66h || @invalid "No operand size override allowed with (e)vex"
+    !prefix.has_lock || @invalid "No lock prefix allowed with (e)vex"
+    prefix.rex == 0 || @invalid "No REX prefix allowed with (e)vex"
+    true
+end
+
+function _parseOpc(input::IO, prefix, mode)
+    c = prefix.first_non_prefix_byte
+    if c == 0xc4
+        @maybe validate_legacy_prefixes_for_vex(prefix)
+        # 3-byte VEX prefix
+        V2 = read(input, UInt8)
+        (V2 & 0b1100 == 0) || @invalid "Invalid value for mmmm"
+        V3 = read(input, UInt8)
+        L = UInt16((V3 & 0b100) >> 2)
+        W = UInt16((V3 & 0b10000000) >> 7)
+        vex_byte = UInt16((V3 & 0b11) << 6) | UInt16(V2 & 0b0011) | L << 9 | W << 8
+        fake_rex = ~((V2 & 0b11100000) >> 5)
+        vvvv = ~((V3 & 0b01111000) >> 3) & 0b1111
+        opc = concretize!(read(input, UInt8))
+        # Our generation scheme is naive and doesn't realize that rex_x
+        # matters. Tell it manually for now.
+        concretize!(rex_x(fake_rex))
+        haskey(vex_opcode_table, vex_byte) || @invalid "Invalid opcode"
+        haskey(vex_opcode_table[vex_byte], opc) || @invalid "Invalid opcode"
+        desc, ops, data = vex_opcode_table[vex_byte][opc]
+        operands = @maybe parseOperands(data.enc, fake_rex, vvvv, opc, ops, input, false)
+        return sprint() do io
+          print(io, desc, " ")
+          println(io, operands)
+        end
+    elseif c == 0xc5
+        @maybe validate_legacy_prefixes_for_vex(prefix)
+        # 2-byte VEX prefix
+        V2 = read(input, UInt8)
+        L = UInt16((V2 & 0b100) >> 2)
+        vex_byte = UInt16((V2 & 0b11) << 6) | 0b1 | L << 9
+        fake_rex = ((~V2 & 0b10000000) >> 5)
+        vvvv = ~((V2 & 0b01111000) >> 3) & 0b1111
+        opc = concretize!(read(input, UInt8))
+        # Our generation scheme is naive and doesn't realize that rex_x
+        # matters. Tell it manually for now.
+        concretize!(rex_x(fake_rex))
+        haskey(vex_opcode_table, vex_byte) || @invalid "Invalid opcode"
+        haskey(vex_opcode_table[vex_byte], opc) || @invalid "Invalid opcode"
+        desc, ops, data = vex_opcode_table[vex_byte][opc]
+        operands = @maybe parseOperands(data.enc, fake_rex, vvvv, opc, ops, input, false)
+        return sprint() do io
+          print(io, desc, " ")
+          println(io, operands)
+        end
+    elseif c == 0x62
+        @maybe validate_legacy_prefixes_for_vex(prefix)
+        # 4-byte EVEX prefix
+        P0 = read(input, UInt8)
+        P1 = read(input, UInt8)
+        P2 = read(input, UInt8)
+        z = (P2 & 0b10000000) >> 7
+        b = (P2 & 0b00010000) >> 4
+        aaa = (P2 & 0b00000111)
+        L′L = UInt16((P2 & 0b01100000) >> 5)
+        W = UInt16((P1 & 0b10000000) >> 7)
+        vex_byte = UInt16(P0 & 0b11) | UInt16((P1 & 0b11) << 6) | L′L << 9 | W << 8
+        # We encode R′ in the high bit of fake rex
+        fake_rex = ~((P0 >> 5) | (P0 & 0b00010000) << 3)
+        vvvv = (((~P1 & 0b01111000) >> 3) | ((~P2 & 0b1000) << 1))
+        opc = read(input, UInt8)
+        haskey(evex_opcode_table, vex_byte) || @invalid "Invalid opcode"
+        haskey(evex_opcode_table[vex_byte], opc) || @invalid "Invalid opcode"
+        desc, ops, data = evex_opcode_table[vex_byte][opc]
+        avx512o = AVX512Operand(aaa, z, (UInt8(data.sae) & b), (UInt8(data.er) & b),
+          ((UInt8(data.er) & b) != 0) ? L′L : 0)
+        operands = @maybe parseOperands(data.enc, fake_rex, vvvv, opc, ops, input, true)
+        return sprint() do io
+          print(io, desc, " ")
+          println(io, tuple(avx512o, operands...))
+        end
+    else
+        return dispatch_simple_op(input, prefix, c)
+    end
+    return nothing
+end
+
+parseAllOpc(data::Vector{UInt8}) = parseAllOpc(IOBuffer(data))
+function parseAllOpc(input::IO)
+    while !eof(input)
+        x = parseOpc(input)
+        @assert x !== nothing
+        println(x)
     end
 end
 
