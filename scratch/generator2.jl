@@ -31,6 +31,7 @@ end
 using X86Assembly: compressed_prefix_status
 
 include("tree_folding.jl")
+include("codegen.jl")
 
 function run!(projection)
   mode = X86Assembly.processor_modes(true, true)
@@ -57,10 +58,46 @@ function run!(projection)
     end
     n += 1
   end
-  @show Tree(root)
   fold!(root)
-  @show Tree(root)
+  function byte_reader(level)
+       level == 1 ? :((prefix.flags >> 8) % UInt8) :
+       level == 2 ? :(prefix.flags % UInt8) :
+       level == 3 ? :(prefix.first_non_prefix_byte) :
+                    :(read(io, UInt8))
+  end
+  code = generate_decoder_for_tree(root, byte_reader)
+  thunk = quote
+    function (io)
+        prefix = X86Assembly.fast_compressed_prefix_scanner(io)
+        $code
+    end
+  end
+  f = eval(thunk)
+  @show f
   println("Number of instruction variants: $n")
+  (tree, f)
 end
 non_prefix_bytes(tree, data) = tree.nbytes_read - 3
-run!(non_prefix_bytes)
+(tree, f) = run!(non_prefix_bytes)
+
+function debug_tree(tree, io)
+    prefix = X86Assembly.fast_compressed_prefix_scanner(io)
+    bytes = [(prefix.flags >> 8)%UInt8, prefix.flags % UInt8, prefix.first_non_prefix_byte]
+    AbstractTrees._print_tree(STDOUT, tree, 20; withinds = true) do buf, node, inds
+        an = tree
+        for (level, ind) in enumerate(inds)
+            an = c = children(an)[ind]
+            if level > length(bytes)
+                push!(bytes, read(io, UInt8))
+            end
+            if !(bytes[level] in c.mask)
+                showcompact(buf, node)
+                return
+            end
+        end
+        Base.print_with_color(:yellow, sprint(showcompact,node))
+    end
+end
+
+buf = IOBuffer([0xf3,0x0f,0x58,0xed])
+debug_tree(tree.tree, buf)

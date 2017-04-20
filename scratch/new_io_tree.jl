@@ -15,6 +15,7 @@ Base.any(m::ChildMask) = any(m.mask)
 Base.broadcast(op::typeof(~),a::ChildMask) = ChildMask(broadcast(op,a.mask))
 Base.:(==)(a::ChildMask, b::ChildMask) = a.mask == b.mask
 Base.hash(c::ChildMask, u::UInt64) = Base.hash(c.mask, u)
+Base.in(b::UInt8, c::ChildMask) = c.mask[b+1]
 
 # Shoe the child mask using braille. One braille character per byte
 function Base.show(io::IO, mask::ChildMask)

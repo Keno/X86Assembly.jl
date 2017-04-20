@@ -145,7 +145,7 @@ ADDSS:
   F3 0F 58 /r                         RM   V/V
       ADDSS xmm1, xmm2/m32
   VEX.NDS.128.F3.0F.WIG 58 /r         RVM  V/V
-      VADDSS xmm1,xmm2, xmm3/m32
+      VADDSS xmm1, xmm2, xmm3/m32
   EVEX.NDS.LIG.F3.0F.W0 58 /r         T1S  V/V
       VADDSS xmm1{k1}{z}, xmm2, xmm3/m32{er}
 """
@@ -433,14 +433,15 @@ end
 # ffllssso67rrrrr
 #  | |\|/|||\_ REX bytes, 0 = no prefix, 1X for 0x4X
 #  | | | ||\__ Saw 0x67 prefix
-#  | |  | |\___ Saw 0x66 prefix
-#  | |  | \____ Saw LOCK prefix
-#  | |  \______ Last valid segment prefix:
-#  | |          000: 0x2E  001: 0x36
-#  | |          010: 0x3R  011: 0x26
-#  | |          100: 0x64  101: 0x65
-#  | \_________ Last F2/F3 Prefix (0: none; 01: F2; 10: F3)
-#  \___________ First F2/F3 Prefix (0: none; 01: F2; 10: F3)
+#  | | | |\___ Saw 0x66 prefix
+#  | | | \____ Saw LOCK prefix
+#  | | \______ Last valid segment prefix:
+#  | |          000: None
+#  | |          001: 0x2E  010: 0x26
+#  | |          011: 0x3E  100: 0x36
+#  | |          101: 0x64  110: 0x65
+#  | \________ Last F2/F3 Prefix (0: none; 01: F2; 10: F3)
+#  \__________ First F2/F3 Prefix (0: none; 01: F2; 10: F3)
 
 struct compressed_prefix_status{T,S}
     nprefix_bytes::UInt8
@@ -455,7 +456,7 @@ first_f2f3(c) = (c.flags >> 13) & 0b11
 function validate_compressed_prefix(c)
     if rex_bits(c) in collect(0x1:0x8)
         return false
-    elseif sssbits(c) in (0b111, 0b110)
+    elseif sssbits(c) == 0b111
         return false
     elseif last_f2f3(c) == 0b11 || first_f2f3(c) == 0b11 || (
         (last_f2f3(c) == 0 && first_f2f3(c) != 0) ||        
@@ -468,8 +469,34 @@ end
 
 const MAX_INSTR_BYTES = 15
 
+compress_f2f3(f2f3) = f2f3 == 0xf2 ? 0b01 :
+                      f2f3 == 0xf3 ? 0b10 :
+                                     0b00
+
+compress_seg_prefix(sp) = sp == 0x00 ? 0b000 :
+                          sp == 0x2E ? 0b001 :
+                          sp == 0x26 ? 0b010 :
+                          sp == 0x3E ? 0b011 :
+                          sp == 0x36 ? 0b100 :
+                          sp == 0x64 ? 0b101 :
+                          sp == 0x65 ? 0b110 :
+                          error()
+
+
+function compressed_prefix_status(nprefix_bytes, first_f2f3, last_f2f3, last_valid_seg_prefix,
+              has_lock, has_66h, has_67h, rex, first_non_prefix_byte)
+    flags = UInt16(compress_f2f3(first_f2f3))                     << 13 |
+            UInt16(compress_f2f3(last_f2f3))                      << 11 |
+            UInt16(compress_seg_prefix(last_valid_seg_prefix))    <<  8 |
+            UInt8(has_lock)                                       <<  7 |
+            UInt8(has_66h)                                        <<  6 |
+            UInt8(has_67h)                                        <<  5 |
+            (rex & 0xF0) >> 2  | (rex & 0x0F)
+    compressed_prefix_status(nprefix_bytes, flags, first_non_prefix_byte)
+end
+
 # This is shared between the fast and the slow path - performance matters
-function fast_prefix_scanner(input, mode = processor_modes(true,true))
+function _fast_prefix_scanner(prefix_status, input, mode)
     nprefix_bytes::UInt8 = 0
     first_f2f3::UInt8 = 0
     last_f2f3::UInt8 = 0
@@ -513,6 +540,12 @@ function fast_prefix_scanner(input, mode = processor_modes(true,true))
     prefix_status(nprefix_bytes, first_f2f3, last_f2f3, last_valid_seg_prefix,
                   has_lock, has_66h, has_67h, rex, first_non_prefix_byte)
 end
+function fast_compressed_prefix_scanner(io, mode = processor_modes(true,true))
+    _fast_prefix_scanner(compressed_prefix_status, io, mode)
+end
+fast_prefix_scanner(io, mode = processor_modes(true, true)) =
+    _fast_prefix_scanner(prefix_status, io, mode)
+
 
 rex_w(rex) = (rex & 0b1000)
 rex_b(rex) = ((rex&0b001) << 3)
@@ -617,9 +650,9 @@ had_f2f3(prefix::compressed_prefix_status) = last_f2f3(prefix) != 0
 had_66(prefix) = prefix.has_66h
 had_66(prefix::compressed_prefix_status) = ((prefix.flags >> 6) & 0b1) != 0
 was_lastf2(prefix) = prefix.last_f2f3 == 0xF2
-was_lastf2(prefix::compressed_prefix_status) = last_f2f3 == 0b01
+was_lastf2(prefix::compressed_prefix_status) = last_f2f3(prefix) == 0b01
 was_lastf3(prefix) = prefix.last_f2f3 == 0xF3
-was_lastf3(prefix::compressed_prefix_status) = last_f2f3 == 0b10
+was_lastf3(prefix::compressed_prefix_status) = last_f2f3(prefix) == 0b10
 make_rex(prefix) = prefix.rex
 make_rex(prefix::compressed_prefix_status) = (rex_bits(prefix) | ((rex_bits(prefix) & 0b10000) << 2)) % UInt8
 
