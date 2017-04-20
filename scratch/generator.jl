@@ -208,13 +208,11 @@ function run!()
                       data = X86Assembly._parseOpc(tree, prefix, mode)
                       # Invalid encoding
                       hadImmediate = tree.hadImmediate ? "..." : ""
-                      #=
                       if data == nothing
                           println("$([prefix_bytes; tree.stack])$hadImmediate: Invalid")
                       else
                           print("$([prefix_bytes; tree.stack])$hadImmediate: $data")
                       end
-                      =#
                       step!(tree)
                       next!(p)
                       n += 1

@@ -170,6 +170,11 @@ ADDSS:
 #          0x66 0xF2 0x0F 0x12 0xED
 #
 # A: F2/F3 Takes precedence
+#
+# Q: What happens with legacy prefixes on (E)VEX instructions?
+#
+# See architecture manual Vol 2. Prefixes LOCK, 66/F2/F3, REX will #UD,
+# segment overrides and 67h are allowed
 
 struct InstrProperties
     # Has support for embedded rounding control
@@ -423,6 +428,44 @@ struct prefix_status{T}
     first_non_prefix_byte::T
 end
 
+# Compress prefix flags into a bitwise representation
+#
+# ffllssso67rrrrr
+#  | |\|/|||\_ REX bytes, 0 = no prefix, 1X for 0x4X
+#  | | | ||\__ Saw 0x67 prefix
+#  | |  | |\___ Saw 0x66 prefix
+#  | |  | \____ Saw LOCK prefix
+#  | |  \______ Last valid segment prefix:
+#  | |          000: 0x2E  001: 0x36
+#  | |          010: 0x3R  011: 0x26
+#  | |          100: 0x64  101: 0x65
+#  | \_________ Last F2/F3 Prefix (0: none; 01: F2; 10: F3)
+#  \___________ First F2/F3 Prefix (0: none; 01: F2; 10: F3)
+
+struct compressed_prefix_status{T,S}
+    nprefix_bytes::UInt8
+    flags::T
+    first_non_prefix_byte::S
+end
+
+rex_bits(c) = c.flags & 0b11111
+sssbits(c) = (c.flags >> 8) & 0b111
+last_f2f3(c) = (c.flags >> 11) & 0b11
+first_f2f3(c) = (c.flags >> 13) & 0b11
+function validate_compressed_prefix(c)
+    if rex_bits(c) in collect(0x1:0x8)
+        return false
+    elseif sssbits(c) in (0b111, 0b110)
+        return false
+    elseif last_f2f3(c) == 0b11 || first_f2f3(c) == 0b11 || (
+        (last_f2f3(c) == 0 && first_f2f3(c) != 0) ||        
+        (first_f2f3(c) == 0 && last_f2f3(c) != 0)
+      )
+        return false
+    end
+    return true
+end
+
 const MAX_INSTR_BYTES = 15
 
 # This is shared between the fast and the slow path - performance matters
@@ -569,21 +612,32 @@ struct processor_modes
     Lflag::Bool
 end
 
+had_f2f3(prefix) = prefix.last_f2f3 != 0
+had_f2f3(prefix::compressed_prefix_status) = last_f2f3(prefix) != 0
+had_66(prefix) = prefix.has_66h
+had_66(prefix::compressed_prefix_status) = ((prefix.flags >> 6) & 0b1) != 0
+was_lastf2(prefix) = prefix.last_f2f3 == 0xF2
+was_lastf2(prefix::compressed_prefix_status) = last_f2f3 == 0b01
+was_lastf3(prefix) = prefix.last_f2f3 == 0xF3
+was_lastf3(prefix::compressed_prefix_status) = last_f2f3 == 0b10
+make_rex(prefix) = prefix.rex
+make_rex(prefix::compressed_prefix_status) = (rex_bits(prefix) | ((rex_bits(prefix) & 0b10000) << 2)) % UInt8
+
 function dispatch_simple_op(input, prefix, opc)
     table = basic_table
     next_opc::typeof(opc) = 0
-    if opc == 0x0F && (prefix.last_f2f3 != 0 || prefix.has_66h)
+    if opc == 0x0F && (had_f2f3(prefix) != 0 || had_66(prefix))
         next_opc = read(input, UInt8)
         table = table[opc]
-        if prefix.last_f2f3 == 0xF2
+        if was_lastf2(prefix)
             if haskey(table_f20f, next_opc)
                 table = table_f20f
             end
-        elseif prefix.last_f2f3 == 0xF3      
+        elseif was_lastf3(prefix)  
             if haskey(table_f30f, next_opc)
                 table = table_f30f
             end
-        elseif prefix.has_66h
+        elseif had_66(prefix)
             if haskey(table_660f, next_opc)
                 table = table_660f
             end
@@ -600,7 +654,7 @@ function dispatch_simple_op(input, prefix, opc)
     end
     # data, not table
     desc, ops, data = table_or_data
-    operands = @maybe parseOperands(data.enc, prefix.rex, 0, opc, ops, input, false)
+    operands = @maybe parseOperands(data.enc, make_rex(prefix), 0, opc, ops, input, false)
     return sprint() do io
       print(io, desc, " ")
       println(io, operands)
@@ -631,6 +685,12 @@ function validate_legacy_prefixes_for_vex(prefix)
     true
 end
 
+function validate_legacy_prefixes_for_vex(prefix::compressed_prefix_status)
+    #                 ffllssso67rrrrr
+    (prefix.flags & 0b111100011011111) == 0 || @invalid "Disallowed prefixes"
+    true
+end
+
 function _parseOpc(input::IO, prefix, mode)
     c = prefix.first_non_prefix_byte
     if c == 0xc4
@@ -644,10 +704,9 @@ function _parseOpc(input::IO, prefix, mode)
         vex_byte = UInt16((V3 & 0b11) << 6) | UInt16(V2 & 0b0011) | L << 9 | W << 8
         fake_rex = ~((V2 & 0b11100000) >> 5)
         vvvv = ~((V3 & 0b01111000) >> 3) & 0b1111
-        opc = concretize!(read(input, UInt8))
+        opc =  read(input, UInt8)
         # Our generation scheme is naive and doesn't realize that rex_x
         # matters. Tell it manually for now.
-        concretize!(rex_x(fake_rex))
         haskey(vex_opcode_table, vex_byte) || @invalid "Invalid opcode"
         haskey(vex_opcode_table[vex_byte], opc) || @invalid "Invalid opcode"
         desc, ops, data = vex_opcode_table[vex_byte][opc]
@@ -664,10 +723,9 @@ function _parseOpc(input::IO, prefix, mode)
         vex_byte = UInt16((V2 & 0b11) << 6) | 0b1 | L << 9
         fake_rex = ((~V2 & 0b10000000) >> 5)
         vvvv = ~((V2 & 0b01111000) >> 3) & 0b1111
-        opc = concretize!(read(input, UInt8))
+        opc = read(input, UInt8)
         # Our generation scheme is naive and doesn't realize that rex_x
         # matters. Tell it manually for now.
-        concretize!(rex_x(fake_rex))
         haskey(vex_opcode_table, vex_byte) || @invalid "Invalid opcode"
         haskey(vex_opcode_table[vex_byte], opc) || @invalid "Invalid opcode"
         desc, ops, data = vex_opcode_table[vex_byte][opc]
