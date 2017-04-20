@@ -496,7 +496,7 @@ function compressed_prefix_status(nprefix_bytes, first_f2f3, last_f2f3, last_val
 end
 
 # This is shared between the fast and the slow path - performance matters
-function _fast_prefix_scanner(prefix_status, input, mode)
+@inline function _fast_prefix_scanner(prefix_status, input, mode)
     nprefix_bytes::UInt8 = 0
     first_f2f3::UInt8 = 0
     last_f2f3::UInt8 = 0

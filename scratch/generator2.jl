@@ -46,14 +46,14 @@ function run!(projection)
     b = read(tree, UInt8)
     compressed_prefix = a | b
     if !X86Assembly.validate_compressed_prefix(compressed_prefix_status(0b0,compressed_prefix,0))
-        next!(tree, "Bad prefix") || break
+        next!(tree, projection(tree, nothing)) || break
         continue
     end
     first_non_prefix_byte = read(tree, UInt8)
     prefix = compressed_prefix_status(0b0, compressed_prefix, first_non_prefix_byte)
     data = X86Assembly._parseOpc(tree, prefix, mode)
     # Create a tree of non-prefix bytes
-    if !next!(tree, data == nothing ? "Invalid" : projection(tree, data))
+    if !next!(tree, projection(tree, data))
         break
     end
     n += 1
@@ -77,7 +77,7 @@ function run!(projection)
   println("Number of instruction variants: $n")
   (tree, f)
 end
-non_prefix_bytes(tree, data) = tree.nbytes_read - 3
+non_prefix_bytes(tree, data) = data == nothing ? -1 : tree.nbytes_read - 3
 (tree, f) = run!(non_prefix_bytes)
 
 function debug_tree(tree, io)
